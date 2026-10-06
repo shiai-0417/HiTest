@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# HiTest 统一入口：发现测试、创建运行目录、保存输出与退出码。
+set -euo pipefail
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+export TZ=${HITEST_TZ:-Asia/Shanghai}
+usage() {
+    cat <<'EOF'
+用法：
+  ./hitest list                    列出测试
+  ./hitest <测试名> [参数...]       运行测试
+  ./hitest load-unload [次数] [等待秒数]  默认 1 轮，每轮加载后等待 100 秒
+
+日志：logs/<测试名>/<年-月-日_时-分-秒>/，例如 2026-09-23_17-00-00/
+时间默认使用北京时间，可用 HITEST_TZ 设置时区。
+可用 HITEST_LOG_ROOT 设置日志根目录；相对路径以项目根目录为基准。
+EOF
+}
+
+case "${1:-help}" in
+    help|-h|--help) usage; exit 0 ;;
+    list)
+        for script in "$ROOT"/scripts/*.sh; do
+            [[ -f "$script" ]] || continue
+            name=${script##*/}
+            printf '%s\n' "${name%.sh}"
+        done
+        exit 0
+        ;;
+esac
+
+name=$1
+shift
+if [[ ! "$name" =~ ^[a-z0-9][a-z0-9_-]*$ || ! -f "$ROOT/scripts/$name.sh" ]]; then
+    printf '未知测试：%s；使用 ./hitest list 查看。\n' "$name" >&2
+    exit 2
+fi
+
+log_root=${HITEST_LOG_ROOT:-"$ROOT/logs"}
+[[ "$log_root" = /* ]] || log_root="$ROOT/$log_root"
+mkdir -p -- "$log_root/$name"
+while true; do
+    HITEST_RUN_DIR="$log_root/$name/$(date +%Y-%m-%d_%H-%M-%S)"
+    if mkdir -- "$HITEST_RUN_DIR" 2>/dev/null; then
+        break
+    fi
+    if [[ ! -e "$HITEST_RUN_DIR" ]]; then
+        printf '无法创建日志目录：%s\n' "$HITEST_RUN_DIR" >&2
+        exit 1
+    fi
+    # 同一秒已有运行目录时等待下一秒，不覆盖历史日志。
+    sleep 1
+done
+export HITEST_RUN_DIR
+{
+    printf 'test=%s\nstarted_at=%s\n' "$name" "$(date +%FT%T%z)"
+    printf 'command='
+    printf '%q ' "$ROOT/hitest" "$name" "$@"
+    printf '\n'
+} > "$HITEST_RUN_DIR/result.txt"
+printf '日志目录：%s\n' "$HITEST_RUN_DIR"
+
+run_test() {
+    local rc
+    local -a statuses
+    set +e
+    bash "$ROOT/scripts/$name.sh" "$@" 2>&1 | tee "$HITEST_RUN_DIR/run.log"
+    statuses=("${PIPESTATUS[@]}")
+    rc=${statuses[0]}
+    if (( statuses[1] != 0 )); then
+        printf '日志写入失败，tee 退出码：%s\n' "${statuses[1]}" >&2
+        (( rc != 0 )) || rc=${statuses[1]}
+    fi
+    return "$rc"
+}
+
+set +e
+if [[ "$name" == load-unload ]]; then
+    export HITEST_STOP_FILE="$HITEST_RUN_DIR/stop.request"
+    stop_code=0
+    wait_interrupted=0
+    request_stop() {
+        wait_interrupted=1
+        if (( stop_code == 0 )); then
+            stop_code=$1
+            printf '%s\n' "$stop_code" > "$HITEST_STOP_FILE"
+            printf '\n已请求安全停止，等待当前驱动操作完成及日志收尾，请勿强制终止。\n'
+        fi
+    }
+    trap 'request_stop 130' INT
+    trap 'request_stop 143' TERM
+    # 让测试及 tee 忽略终端信号，通过请求文件在安全位置停止。
+    # 显式保留 stdin，供 sudo 验证使用。
+    (trap '' INT TERM; run_test "$@") <&0 &
+    worker=$!
+    while true; do
+        wait_interrupted=0
+        wait "$worker"
+        rc=$?
+        (( wait_interrupted != 0 )) || break
+    done
+else
+    run_test "$@"
+    rc=$?
+fi
+set -e
+printf 'finished_at=%s\nexit_code=%s\n' "$(date +%FT%T%z)" "$rc" >> "$HITEST_RUN_DIR/result.txt"
+printf '测试结束，退出码：%s；日志：%s\n' "$rc" "$HITEST_RUN_DIR"
+exit "$rc"
