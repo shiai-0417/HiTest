@@ -5,7 +5,7 @@
 ## 快速开始
 
 ```bash
-cd /home/shiai/HiTest
+cd /home/shiai/aototest/subtools/HiTest
 ./hitest list
 ./hitest load-unload         # 默认 1 轮，每轮等待 100 秒
 ./hitest load-unload 3       # 3 轮，每轮等待 100 秒
@@ -24,7 +24,9 @@ HiTest/
 ├── README.md
 ├── .gitignore
 ├── scripts/                # 测试脚本，一个文件对应一个命令
-│   └── load-unload.sh
+│   ├── load-unload.sh
+│   └── nvidia-load-unload.sh
+├── deploy/deploy.py        # 使用本机平台凭据部署到登记的测试机
 ├── tests/                  # 工程自身的模拟验证，不操作设备
 │   └── test_safe_stop.py
 └── logs/                   # 运行产物，不提交到版本库
@@ -72,7 +74,7 @@ HiTest/
 
 ## 中途停止
 
-运行 `./hitest load-unload`（或直接用 Bash 运行测试脚本）时，按一次 Ctrl+C
+运行 `./hitest load-unload`、`./hitest nvidia-load-unload`（或直接用 Bash 运行测试脚本）时，按一次 Ctrl+C
 会请求安全停止，不直接打断正在执行的驱动命令：
 
 | 收到请求时的阶段 | 处理方式 |
@@ -102,7 +104,7 @@ Ctrl+C 安全停止的退出码为 130，SIGTERM 为 143；驱动操作或日志
 修改停止逻辑后，可执行模拟验证（需要 Python 3，不需要 sudo、不操作真实驱动）：
 
 ```bash
-python3 tests/test_safe_stop.py
+python3 -m unittest discover -s tests -v
 ```
 
 ## 日志
@@ -145,3 +147,68 @@ HITEST_LOG_ROOT=/home/shiai/hitest-logs ./hitest load-unload 3
 
 无需修改入口，`./hitest list` 会自动发现脚本，使用 `./hitest <测试名> [参数...]` 运行。
 相对资源路径应基于脚本自身位置解析，不要依赖调用者的当前目录。
+
+
+## 英伟达驱动加载/卸载
+
+独立命令 `nvidia-load-unload`，不会调用海光的 hy-smi，也不会安装驱动。需要 root、Bash、modprobe/modinfo、nvidia-smi、dmesg、fuser（通常来自 psmisc）、flock（通常来自 util-linux）。测试针对 Linux 已安装的 NVIDIA 闭源或开放内核模块，不测试 nouveau。
+
+```bash
+cd /home/shiai/aototest/subtools/HiTest
+sudo ./hitest nvidia-load-unload --check  # 仅检查依赖、显卡及占用，不加载或卸载
+sudo ./hitest nvidia-load-unload 3 0      # 3 轮，每轮加载后立即验证并卸载
+sudo ./hitest nvidia-load-unload 10 30    # 10 轮，每轮验证后等待 30 秒
+```
+
+默认 1 轮、100 秒，次数和等待时间的范围与海光脚本一致。直接运行 `bash scripts/nvidia-load-unload.sh ...` 也会经统一入口保存日志和处理停止请求。
+
+脚本先确认 PCI NVIDIA 显卡、模块文件和驱动版本；检测到 nouveau、设备进程占用或未知内核模块引用时，停止且不修改模块。日志中的 `device_users.txt` 给出占用进程。请在空闲测试机使用；GPU 任务、显示服务或 nvidia-persistenced 等占用需由管理员事先处理，脚本不会杀进程、关闭图形会话或修改服务配置。模块列表及持久化守护进程行为参考 [NVIDIA 模块说明](https://docs.nvidia.com/datacenter/tesla/driver-installation-guide/latest/kernel-modules.html) 和 [NVIDIA 持久化守护进程说明](https://docs.nvidia.com/deploy/driver-persistence/persistence-daemon.html)。
+
+- 加载顺序：nvidia → nvidia_uvm → nvidia_modeset → nvidia_drm；显示模块仅在已安装时纳入，可用于仅安装计算组件的机器。
+- 初始已加载的 nvidia_peermem、nvidia_fs 也会纳入。卸载顺序为 nvidia_fs → nvidia_peermem → nvidia_drm → nvidia_modeset → nvidia_uvm → nvidia，跳过当前未加载的模块。
+- 初始已有模块时，先卸载建立基线。每轮验证模块实际存在，读取 nvidia-smi GPU 信息和 UUID；GPU 集合变化、命令失败或空输出均停止，不算成功。卸载后检查模块消失，不再调用 nvidia-smi，避免触发重新加载。
+- 主机级 flock 保证同一主机只运行一个本命令。模块加载/卸载失败后不强制卸载、不重试、不进入下一轮；状态记录为 unknown，需人工核对。GPU 查询失败时，会尝试本轮正常卸载再以失败码结束。
+- Ctrl+C/SIGTERM 采用统一的安全停止机制：当前模块命令返回后收尾；若加载只完成了一部分，卸载已加载模块，不计为完整轮次。不能处理 kill -9、掉电或不返回的内核命令。
+
+**正常完成后 NVIDIA 模块处于卸载状态，不会恢复最初加载状态。** 后续需由管理员按机器用途重新加载驱动或恢复相关服务。退出码 0 表示循环、模块状态及 GPU 查询检查通过，不代表已自动分析 dmesg 中的 Xid 或其他错误。
+
+日志放在 `logs/nvidia-load-unload/<时间>/`，沿用 run.log、result.txt、version.txt、dmesg_before.txt、dmesg_round_N.txt 和 sut_dmesg.txt，并增加：
+
+| 文件 | 内容 |
+| --- | --- |
+| nvidia_smi_round_N.csv | 每轮 GPU UUID、名称及实际驱动版本 |
+| gpu_uuids_round_N.txt | 每轮 GPU UUID 集合，用于比较设备是否丢失或变化 |
+| device_users.txt | 最近一次卸载前的设备占用检查输出 |
+
+## 部署到 192.168.0.107
+
+从本机的工作副本打包，包含本次未提交的英伟达脚本；无需在测试机访问 GitHub。部署器使用相邻 `hygon-dcu-test-platform` 的数据库和 SSHTransport，复用管理员页面已保存的 root 凭据及严格主机指纹校验。不会上传凭据、Git 元数据、历史日志，密码不放进参数或部署包。
+
+```bash
+cd /home/shiai/aototest/subtools/HiTest
+python3 deploy/deploy.py --host 192.168.0.107 --actor shiai
+```
+
+平台数据库与凭据须已初始化；`--actor` 指定用于审计的启用平台管理员账号。系统管理员需有本机凭据文件的读取权限，API/worker 正在使用的 `DCU_*` 环境配置也应传给此终端。平台路径不同时，增加 `--platform-dir /实际平台路径`。`--package-only` 只生成部署包，不连接测试机。
+
+部署前会申请 15 分钟平台预约，已有测试、工具操作或预约占用时拒绝，结束后只释放本次预约。部署器检查目标 root 与 Python 3.10+，通过 SCP 传送部署包，核对压缩包和每个文件的 SHA256，拒绝路径越界、符号链接和清单不符的归档。通过 Bash 语法和 `hitest list` 检查后，原子切换 current；保留之前版本和共享日志目录。部署过程不执行任何驱动测试。
+
+按当前 107 工作目录配置，部署位置为：
+
+```text
+/var/lib/dcu-tests/tools/HiTest/
+├── current -> releases/<源文件内容标识>
+├── releases/<源文件内容标识>/
+└── logs/    # 跨版本保留的测试日志
+```
+
+目标机部署成功后使用：
+
+```bash
+/var/lib/dcu-tests/tools/HiTest/current/hitest list
+/var/lib/dcu-tests/tools/HiTest/current/hitest nvidia-load-unload --check
+# 在空闲的 NVIDIA 测试机上实际执行；107 若无 NVIDIA 显卡，前置检查会拒绝。
+/var/lib/dcu-tests/tools/HiTest/current/hitest nvidia-load-unload 3 0
+```
+
+本机 `logs/deploy/<时间-标识>/deployment-result.json` 保存部署包位置、校验值和真实成功/失败结果，成功部署会记入平台操作记录。当前助手环境创建 SSH socket 被禁止（Operation not permitted），所以尚未实际复制到 107；本机终端执行上面的部署命令可继续。所有工程测试使用临时模拟模块、GPU 命令和本地暂存目录，不操作真实显卡，不代替远程机器验收。

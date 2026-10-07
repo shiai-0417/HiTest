@@ -9,7 +9,8 @@ usage() {
 用法：
   ./hitest list                    列出测试
   ./hitest <测试名> [参数...]       运行测试
-  ./hitest load-unload [次数] [等待秒数]  默认 1 轮，每轮加载后等待 100 秒
+  ./hitest load-unload [次数] [等待秒数]  海光，默认 1 轮、100 秒
+  ./hitest nvidia-load-unload [--check] [次数] [等待秒数]  英伟达，默认 1 轮、100 秒
 
 日志：logs/<测试名>/<年-月-日_时-分-秒>/，例如 2026-09-23_17-00-00/
 时间默认使用北京时间，可用 HITEST_TZ 设置时区。
@@ -75,7 +76,7 @@ run_test() {
 }
 
 set +e
-if [[ "$name" == load-unload ]]; then
+if [[ "$name" == load-unload || "$name" == nvidia-load-unload ]]; then
     export HITEST_STOP_FILE="$HITEST_RUN_DIR/stop.request"
     stop_code=0
     wait_interrupted=0
